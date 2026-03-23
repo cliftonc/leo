@@ -7,10 +7,18 @@ SEO management CLI for Google Search Console. Inspect indexing status, request i
 ### 1. Install
 
 ```bash
-cd ~/work/leo
+# Via npm (recommended)
+npm install -g @cliftonc/leo
+
+# Or run directly without installing
+npx @cliftonc/leo
+
+# Or from source
+git clone https://github.com/cliftonc/leo.git
+cd leo
 npm install
 npm run build
-npm link        # makes `leo` available globally
+npm link
 ```
 
 ### 2. Google Cloud Project
