@@ -1,19 +1,38 @@
 {
-  "name": "leo",
+  "name": "@cliftonc/leo",
   "version": "1.0.0",
   "description": "SEO management CLI for Google Search Console",
   "type": "module",
   "bin": {
-    "leo": "./dist/cli.js"
+    "leo": "dist/cli.js"
   },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run build",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js"
   },
-  "keywords": ["seo", "google-search-console", "indexing", "cli"],
-  "author": "",
+  "keywords": [
+    "seo",
+    "google-search-console",
+    "indexing",
+    "cli",
+    "url-inspection",
+    "search-analytics"
+  ],
+  "author": "cliftonc",
   "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cliftonc/leo.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@googleapis/searchconsole": "^6.0.1",
     "chalk": "^5.6.2",

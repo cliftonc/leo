@@ -2,13 +2,37 @@
 
 import { Command } from 'commander'
 import chalk from 'chalk'
-import ora from 'ora'
+import baseOra from 'ora'
 import { getAuthClient, getConfigDir } from './auth.js'
 import { fetchSitemap } from './sitemap.js'
 import { inspectUrl, isIndexed, formatResult } from './inspect.js'
 import { requestIndexing, getIndexingStatus } from './indexing.js'
 import { querySearchAnalytics, listSites, getSitemaps, daysAgo, formatDate } from './analytics.js'
 import { processWithRateLimit } from './rate-limit.js'
+import { loadCache, saveCache, updateCacheEntry, getUrlsToCheck, getCacheSummary } from './cache.js'
+
+// Ora's discardStdin (default: true) puts stdin in raw mode, which
+// prevents Ctrl-C from generating SIGINT when the event loop is busy
+// with network requests. Wrap ora to always disable it.
+function ora(text: string | Parameters<typeof baseOra>[0]) {
+  const opts = typeof text === 'string' ? { text } : text
+  return baseOra({ ...(opts as object), discardStdin: false })
+}
+
+// Listen for Ctrl-C directly on stdin. We can't rely on SIGINT because
+// googleapis or its dependencies remove our handlers.
+if (process.stdin.isTTY) {
+  process.stdin.setRawMode(true)
+  process.stdin.resume()
+  process.stdin.unref() // Don't keep process alive just for Ctrl-C
+  process.stdin.setEncoding('utf-8')
+  process.stdin.on('data', (key: string) => {
+    if (key === '\u0003') { // Ctrl-C
+      process.stderr.write('\n')
+      process.exit(130)
+    }
+  })
+}
 
 const program = new Command()
 
@@ -78,7 +102,10 @@ program
   .action(async (domain: string) => {
     const spinner = ora(`Fetching sitemap for ${domain}...`).start()
     try {
-      const urls = await fetchSitemap(domain)
+      // Try with auth (to use GSC-registered sitemaps) then fall back
+      let auth
+      try { auth = await getAuthClient() } catch { /* no auth, that's fine */ }
+      const urls = await fetchSitemap(domain, auth)
       spinner.stop()
 
       console.log(chalk.bold(`\nSitemap URLs (${urls.length}):\n`))
@@ -124,70 +151,170 @@ program
     }
   })
 
+// ─── status ──────────────────────────────────────────────────────
+
+program
+  .command('status <domain>')
+  .description('Show cached indexing status for a domain (no API calls)')
+  .option('--not-indexed', 'Only show non-indexed URLs')
+  .action(async (domain: string, opts) => {
+    const cache = loadCache(domain)
+    const summary = getCacheSummary(cache)
+
+    if (summary.total === 0) {
+      console.log(chalk.yellow(`No cached data for ${domain}. Run ${chalk.white(`leo inspect ${domain}`)} first.`))
+      return
+    }
+
+    console.log(chalk.bold(`\nCached Index Status for ${domain}\n`))
+    console.log(`  Last updated: ${chalk.dim(summary.lastUpdated)}`)
+    console.log(`  Total URLs:   ${summary.total}`)
+    console.log(chalk.green(`  Indexed:      ${summary.indexed}`))
+    console.log(chalk.yellow(`  Not indexed:  ${summary.notIndexed}`))
+    console.log()
+
+    const entries = Object.values(cache.urls)
+    const toShow = opts.notIndexed ? entries.filter((e) => !e.indexed) : entries
+
+    for (const entry of toShow) {
+      const icon = entry.indexed ? chalk.green('✓') : chalk.yellow('○')
+      const checked = chalk.dim(`[${entry.lastChecked.split('T')[0]}]`)
+      console.log(`  ${icon} ${checked} ${entry.url}`)
+    }
+    console.log()
+  })
+
 // ─── inspect ─────────────────────────────────────────────────────
 
 program
   .command('inspect <domain> [urls...]')
-  .description('Inspect indexing status of specific URLs (or all sitemap URLs)')
+  .description('Inspect indexing status (uses cache — only rechecks non-indexed)')
   .option('--all', 'Inspect all URLs from sitemap')
+  .option('--force', 'Ignore cache and recheck all URLs')
   .option('--not-indexed', 'Only show URLs that are NOT indexed')
   .option('--limit <n>', 'Max URLs to inspect', '50')
-  .option('--rpm <n>', 'Requests per minute (default: 30)', '30')
+  .option('--rpm <n>', 'Requests per minute', '120')
+  .option('-j, --jobs <n>', 'Parallel requests (default: 4)', '4')
   .action(async (domain: string, urls: string[], opts) => {
     try {
       const auth = await getAuthClient()
       const siteUrl = toSiteUrl(domain)
+      const cache = loadCache(domain)
 
-      let urlsToInspect: string[] = urls
+      let allUrls: string[] = urls
 
       if (opts.all || urls.length === 0) {
         const spinner = ora('Fetching sitemap...').start()
-        const sitemapUrls = await fetchSitemap(domain)
+        const sitemapUrls = await fetchSitemap(domain, auth)
         spinner.stop()
-        urlsToInspect = sitemapUrls.map((u) => u.loc)
-        console.log(chalk.dim(`Found ${urlsToInspect.length} URLs in sitemap`))
+        allUrls = sitemapUrls.map((u) => u.loc)
+        console.log(chalk.dim(`Found ${allUrls.length} URLs in sitemap`))
       }
 
+      // Use cache to skip already-indexed URLs
+      const { toCheck, cached } = getUrlsToCheck(cache, allUrls, !!opts.force)
+
+      if (cached.length > 0) {
+        console.log(chalk.dim(`Skipping ${cached.length} already-indexed URLs (use --force to recheck)`))
+      }
+
+      let urlsToInspect = toCheck
       const limit = parseInt(opts.limit, 10)
       if (urlsToInspect.length > limit) {
         console.log(chalk.yellow(`Limiting to first ${limit} URLs (use --limit to change)`))
         urlsToInspect = urlsToInspect.slice(0, limit)
       }
 
-      console.log(chalk.bold(`\nInspecting ${urlsToInspect.length} URLs...\n`))
-
       const indexed: string[] = []
       const notIndexed: string[] = []
       const errors: string[] = []
 
-      const results = await processWithRateLimit(
-        urlsToInspect,
-        (url) => inspectUrl(auth, siteUrl, url),
-        {
-          requestsPerMinute: parseInt(opts.rpm, 10),
-          onProgress: (done, total, result) => {
-            const pct = Math.round((done / total) * 100)
-            const icon = result.error
-              ? chalk.red('✗')
-              : isIndexed(result)
-                ? chalk.green('✓')
-                : chalk.yellow('○')
-            const status = `[${done}/${total} ${pct}%]`
-            console.log(`${icon} ${chalk.dim(status)} ${result.url}`)
+      if (urlsToInspect.length > 0) {
+        console.log(chalk.bold(`\nInspecting ${urlsToInspect.length} URLs...\n`))
 
-            if (result.error) errors.push(result.url)
-            else if (isIndexed(result)) indexed.push(result.url)
-            else notIndexed.push(result.url)
-          },
+        // Track in-flight URLs for live display
+        const inFlight = new Set<string>()
+        const spinner = { current: null as ReturnType<typeof baseOra> | null }
+
+        function updateSpinner() {
+          const urls = [...inFlight]
+          if (urls.length === 0) {
+            spinner.current?.stop()
+            spinner.current = null
+            return
+          }
+          const text = urls.map((u) => chalk.dim(u.replace(/^https?:\/\/[^/]+/, ''))).join('  ')
+          if (!spinner.current) {
+            spinner.current = ora({ text, discardStdin: false }).start()
+          } else {
+            spinner.current.text = text
+          }
         }
-      )
 
-      // Summary
+        const results = await processWithRateLimit(
+          urlsToInspect,
+          (url) => inspectUrl(auth, siteUrl, url),
+          {
+            requestsPerMinute: parseInt(opts.rpm, 10),
+            concurrency: parseInt(opts.jobs, 10),
+            onStart: (url) => {
+              inFlight.add(url)
+              updateSpinner()
+            },
+            onProgress: (done, total, result) => {
+              inFlight.delete(result.url)
+              spinner.current?.stop()
+              spinner.current = null
+
+              const pct = Math.round((done / total) * 100)
+              const resultIndexed = isIndexed(result)
+              const icon = result.error
+                ? chalk.red('✗')
+                : resultIndexed
+                  ? chalk.green('✓')
+                  : chalk.yellow('○')
+              const status = `[${done}/${total} ${pct}%]`
+              console.log(`${icon} ${chalk.dim(status)} ${result.url}`)
+              if (result.error) {
+                console.log(`  ${chalk.dim(result.error)}`)
+              }
+
+              if (result.error) {
+                errors.push(result.url)
+              } else {
+                updateCacheEntry(cache, result.url, resultIndexed, result.verdict, result.coverageState, result.lastCrawlTime)
+                saveCache(cache)
+                if (resultIndexed) indexed.push(result.url)
+                else notIndexed.push(result.url)
+              }
+
+              updateSpinner()
+            },
+          }
+        )
+
+        spinner.current?.stop()
+
+        if (opts.notIndexed) {
+          console.log(chalk.bold('\nDetailed Not-Indexed Results:\n'))
+          for (const result of results) {
+            if (!isIndexed(result)) {
+              console.log(formatResult(result))
+              console.log()
+            }
+          }
+        }
+      }
+
+      // Include cached results in totals
+      const totalIndexed = indexed.length + cached.length
+      const totalNotIndexed = notIndexed.length
+
       console.log(chalk.bold('\n── Summary ──\n'))
-      console.log(chalk.green(`  Indexed:     ${indexed.length}`))
-      console.log(chalk.yellow(`  Not indexed: ${notIndexed.length}`))
+      console.log(chalk.green(`  Indexed:      ${totalIndexed}`) + (cached.length > 0 ? chalk.dim(` (${cached.length} from cache)`) : ''))
+      console.log(chalk.yellow(`  Not indexed:  ${totalNotIndexed}`))
       if (errors.length > 0) {
-        console.log(chalk.red(`  Errors:      ${errors.length}`))
+        console.log(chalk.red(`  Errors:       ${errors.length}`))
       }
 
       if (notIndexed.length > 0) {
@@ -198,17 +325,6 @@ program
         console.log(
           chalk.dim(`\nTip: Run ${chalk.white(`leo submit ${domain} --not-indexed`)} to request indexing`)
         )
-      }
-
-      if (opts.notIndexed) {
-        // Detailed output for not-indexed
-        console.log(chalk.bold('\nDetailed Not-Indexed Results:\n'))
-        for (const result of results) {
-          if (!isIndexed(result)) {
-            console.log(formatResult(result))
-            console.log()
-          }
-        }
       }
 
       console.log()
@@ -224,9 +340,10 @@ program
   .command('submit <domain> [urls...]')
   .description('Request indexing for URLs via the Indexing API')
   .option('--all', 'Submit all sitemap URLs')
-  .option('--not-indexed', 'First inspect, then submit only non-indexed URLs')
+  .option('--not-indexed', 'Submit non-indexed URLs (cache + inspect new)')
   .option('--limit <n>', 'Max URLs to submit', '20')
   .option('--rpm <n>', 'Requests per minute (default: 10)', '10')
+  .option('-j, --jobs <n>', 'Parallel inspection requests (default: 4)', '4')
   .option('--dry-run', 'Show what would be submitted without actually submitting')
   .action(async (domain: string, urls: string[], opts) => {
     try {
@@ -236,37 +353,50 @@ program
       let urlsToSubmit: string[] = urls
 
       if (opts.notIndexed) {
-        // First inspect all sitemap URLs, then submit non-indexed ones
-        const spinner = ora('Fetching sitemap...').start()
-        const sitemapUrls = await fetchSitemap(domain)
-        spinner.stop()
+        const cache = loadCache(domain)
 
-        console.log(chalk.dim(`Found ${sitemapUrls.length} URLs. Inspecting to find non-indexed...`))
+        // Get sitemap to find any new URLs not yet in cache
+        const sitemapSpinner = ora('Fetching sitemap...').start()
+        const sitemapUrls = await fetchSitemap(domain, auth)
+        sitemapSpinner.stop()
+        const allUrls = sitemapUrls.map((u) => u.loc)
 
-        const inspectLimit = Math.min(sitemapUrls.length, 200) // Inspect up to 200
-        const urlsToCheck = sitemapUrls.slice(0, inspectLimit).map((u) => u.loc)
+        // Trusted from cache: non-indexed URLs go straight to submit
+        const cachedNotIndexed = Object.values(cache.urls)
+          .filter((e) => !e.indexed && allUrls.includes(e.url))
+          .map((e) => e.url)
 
-        const notIndexedUrls: string[] = []
-        await processWithRateLimit(
-          urlsToCheck,
-          (url) => inspectUrl(auth, siteUrl, url),
-          {
-            requestsPerMinute: 30,
-            onProgress: (done, total, result) => {
-              const pct = Math.round((done / total) * 100)
-              process.stdout.write(`\r  Inspecting... ${done}/${total} (${pct}%)`)
-              if (!isIndexed(result) && !result.error) {
-                notIndexedUrls.push(result.url)
-              }
-            },
-          }
-        )
-        console.log()
-        urlsToSubmit = notIndexedUrls
-        console.log(chalk.dim(`Found ${urlsToSubmit.length} non-indexed URLs`))
+        // New URLs not in cache at all — need to inspect these
+        const uncached = allUrls.filter((u) => !cache.urls[u])
+        const freshNotIndexed: string[] = []
+
+        if (uncached.length > 0) {
+          console.log(chalk.dim(`  ${cachedNotIndexed.length} not indexed (from cache)`))
+          console.log(chalk.dim(`  Inspecting ${uncached.length} new URLs...`))
+          await processWithRateLimit(
+            uncached,
+            (url) => inspectUrl(auth, siteUrl, url),
+            {
+              requestsPerMinute: 120,
+              concurrency: parseInt(opts.jobs, 10),
+              onProgress: (_done, _total, result) => {
+                const resultIndexed = isIndexed(result)
+                if (!result.error) {
+                  updateCacheEntry(cache, result.url, resultIndexed, result.verdict, result.coverageState, result.lastCrawlTime)
+                  saveCache(cache)
+                  if (!resultIndexed) freshNotIndexed.push(result.url)
+                }
+              },
+            }
+          )
+        }
+
+        urlsToSubmit = [...cachedNotIndexed, ...freshNotIndexed]
+        const cachedIndexed = Object.values(cache.urls).filter((e) => e.indexed).length
+        console.log(chalk.dim(`  ${cachedIndexed} indexed, ${urlsToSubmit.length} to submit`))
       } else if (opts.all || urls.length === 0) {
         const spinner = ora('Fetching sitemap...').start()
-        const sitemapUrls = await fetchSitemap(domain)
+        const sitemapUrls = await fetchSitemap(domain, auth)
         spinner.stop()
         urlsToSubmit = sitemapUrls.map((u) => u.loc)
       }
@@ -309,28 +439,197 @@ program
       let succeeded = 0
       let failed = 0
 
+      const submitInFlight = new Set<string>()
+      const submitSpinner = { current: null as ReturnType<typeof baseOra> | null }
+
+      function updateSubmitSpinner() {
+        const urls = [...submitInFlight]
+        if (urls.length === 0) {
+          submitSpinner.current?.stop()
+          submitSpinner.current = null
+          return
+        }
+        const text = urls.map((u) => chalk.dim(u.replace(/^https?:\/\/[^/]+/, ''))).join('  ')
+        if (!submitSpinner.current) {
+          submitSpinner.current = ora({ text, discardStdin: false }).start()
+        } else {
+          submitSpinner.current.text = text
+        }
+      }
+
       await processWithRateLimit(
         urlsToSubmit,
         (url) => requestIndexing(auth, url),
         {
           requestsPerMinute: parseInt(opts.rpm, 10),
+          onStart: (url) => {
+            submitInFlight.add(url)
+            updateSubmitSpinner()
+          },
           onProgress: (done, total, result) => {
+            submitInFlight.delete(result.url)
+            submitSpinner.current?.stop()
+            submitSpinner.current = null
+
+            const pct = Math.round((done / total) * 100)
+            const status = `[${done}/${total} ${pct}%]`
             if (result.error) {
-              console.log(`${chalk.red('✗')} ${result.url}`)
-              console.log(chalk.dim(`  ${result.error}`))
+              console.log(`${chalk.red('✗')} ${chalk.dim(status)} ${result.url}`)
+              console.log(`  ${chalk.dim(result.error)}`)
               failed++
             } else {
-              console.log(`${chalk.green('✓')} ${result.url}`)
+              console.log(`${chalk.green('✓')} ${chalk.dim(status)} ${result.url}`)
               succeeded++
             }
+
+            updateSubmitSpinner()
           },
         }
       )
+
+      submitSpinner.current?.stop()
 
       console.log(chalk.bold('\n── Summary ──\n'))
       console.log(chalk.green(`  Submitted:  ${succeeded}`))
       if (failed > 0) {
         console.log(chalk.red(`  Failed:     ${failed}`))
+      }
+      console.log()
+    } catch (err: any) {
+      console.error(chalk.red(err.message))
+      process.exit(1)
+    }
+  })
+
+// ─── auto ────────────────────────────────────────────────────────
+
+program
+  .command('auto <domain>')
+  .description('Automatically find and submit non-indexed pages (uses cache)')
+  .option('--force', 'Ignore cache and recheck all URLs')
+  .option('--limit <n>', 'Max URLs to submit for indexing', '50')
+  .option('--inspect-rpm <n>', 'Requests per minute for inspection', '120')
+  .option('--submit-rpm <n>', 'Requests per minute for submission', '10')
+  .option('-j, --jobs <n>', 'Parallel inspection requests (default: 4)', '4')
+  .option('--dry-run', 'Inspect and report but do not submit')
+  .action(async (domain: string, opts) => {
+    try {
+      const auth = await getAuthClient()
+      const siteUrl = toSiteUrl(domain)
+      const cache = loadCache(domain)
+
+      // ── Step 1: Fetch sitemap ──────────────────────────────────
+      const step1 = ora('Step 1/3 — Fetching sitemap...').start()
+      const sitemapUrls = await fetchSitemap(domain, auth)
+      step1.succeed(`Step 1/3 — Found ${sitemapUrls.length} URLs in sitemap`)
+
+      // ── Step 2: Inspect (cache-aware) ──────────────────────────
+      const allUrls = sitemapUrls.map((u) => u.loc)
+      const { toCheck, cached } = getUrlsToCheck(cache, allUrls, !!opts.force)
+
+      const cachedIndexed = cached.length
+      const indexed: string[] = []
+      const notIndexed: string[] = []
+      const errors: string[] = []
+
+      if (cached.length > 0 && !opts.force) {
+        console.log(chalk.dim(`  ${cached.length} URLs already indexed (cached) — skipping`))
+      }
+
+      if (toCheck.length > 0) {
+        const inspectRpm = parseInt(opts.inspectRpm, 10)
+        const step2 = ora(`Step 2/3 — Inspecting ${toCheck.length} URLs...`).start()
+
+        await processWithRateLimit(
+          toCheck,
+          (url) => inspectUrl(auth, siteUrl, url),
+          {
+            requestsPerMinute: inspectRpm,
+            concurrency: parseInt(opts.jobs, 10),
+            onProgress: (done, total, result) => {
+              step2.text = `Step 2/3 — Inspecting... ${done}/${total} (${Math.round((done / total) * 100)}%)`
+              const resultIndexed = isIndexed(result)
+              if (result.error) {
+                errors.push(result.url)
+              } else {
+                updateCacheEntry(cache, result.url, resultIndexed, result.verdict, result.coverageState, result.lastCrawlTime)
+                saveCache(cache)
+                if (resultIndexed) indexed.push(result.url)
+                else notIndexed.push(result.url)
+              }
+            },
+          }
+        )
+
+        step2.succeed(
+          `Step 2/3 — Inspection complete: ${chalk.green(`${indexed.length} newly indexed`)}, ${chalk.yellow(`${notIndexed.length} not indexed`)}` +
+            (errors.length > 0 ? `, ${chalk.red(`${errors.length} errors`)}` : '')
+        )
+      } else {
+        console.log(chalk.green('  Step 2/3 — All URLs already indexed in cache!'))
+      }
+
+      if (notIndexed.length === 0) {
+        console.log(chalk.green('\nAll pages are indexed! Nothing to do.'))
+        return
+      }
+
+      // Show what's not indexed
+      console.log(chalk.bold('\nNot indexed:\n'))
+      for (const url of notIndexed) {
+        console.log(`  ${chalk.yellow('○')} ${url}`)
+      }
+
+      if (opts.dryRun) {
+        console.log(chalk.dim(`\n  Dry run — skipping submission. Run without --dry-run to submit.\n`))
+        return
+      }
+
+      // ── Step 3: Submit non-indexed URLs ────────────────────────
+      const limit = parseInt(opts.limit, 10)
+      let urlsToSubmit = notIndexed
+      if (urlsToSubmit.length > limit) {
+        console.log(chalk.yellow(`\nLimiting to ${limit} submissions (use --limit to change)`))
+        urlsToSubmit = urlsToSubmit.slice(0, limit)
+      }
+
+      const submitRpm = parseInt(opts.submitRpm, 10)
+      console.log(
+        chalk.dim(
+          '\nNote: The Indexing API is officially for JobPosting/BroadcastEvent pages.\n' +
+            'For other page types it may work but is not guaranteed by Google.\n'
+        )
+      )
+
+      const step3 = ora(`Step 3/3 — Submitting ${urlsToSubmit.length} URLs...`).start()
+      let succeeded = 0
+      let failed = 0
+
+      await processWithRateLimit(
+        urlsToSubmit,
+        (url) => requestIndexing(auth, url),
+        {
+          requestsPerMinute: submitRpm,
+          onProgress: (done, total, result) => {
+            step3.text = `Step 3/3 — Submitting... ${done}/${total}`
+            if (result.error) failed++
+            else succeeded++
+          },
+        }
+      )
+
+      step3.succeed(`Step 3/3 — Submission complete`)
+
+      // ── Summary ────────────────────────────────────────────────
+      console.log(chalk.bold('\n── Summary ──\n'))
+      console.log(`  Sitemap URLs:    ${allUrls.length}`)
+      console.log(chalk.green(`  Already indexed: ${cachedIndexed + indexed.length}`) + (cachedIndexed > 0 ? chalk.dim(` (${cachedIndexed} cached)`) : ''))
+      console.log(chalk.green(`  Submitted:       ${succeeded}`))
+      if (failed > 0) {
+        console.log(chalk.red(`  Submit failed:   ${failed}`))
+      }
+      if (errors.length > 0) {
+        console.log(chalk.red(`  Inspect errors:  ${errors.length}`))
       }
       console.log()
     } catch (err: any) {

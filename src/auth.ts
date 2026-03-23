@@ -10,6 +10,8 @@ const SCOPES = [
   'https://www.googleapis.com/auth/indexing',
 ]
 
+const AUTH_PORT = 3456
+
 const CONFIG_DIR = path.join(
   process.env.HOME || process.env.USERPROFILE || '.',
   '.leo'
@@ -67,10 +69,13 @@ function loadToken(): object | null {
   }
 }
 
-async function getAuthCodeViaLocalServer(authUrl: string): Promise<string> {
+async function getAuthCodeViaLocalServer(
+  authUrl: string,
+  port: number
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
-      const url = new URL(req.url || '/', `http://localhost:3456`)
+      const url = new URL(req.url || '/', `http://localhost:${port}`)
       const code = url.searchParams.get('code')
       if (code) {
         res.writeHead(200, { 'Content-Type': 'text/html' })
@@ -87,12 +92,13 @@ async function getAuthCodeViaLocalServer(authUrl: string): Promise<string> {
       }
     })
 
-    server.listen(3456, () => {
+    server.listen(port, () => {
+      console.log(`\nListening on http://localhost:${port} for OAuth callback`)
       console.log(`\nOpen this URL in your browser to authorize:\n\n${authUrl}\n`)
     })
 
     server.on('error', (err) => {
-      reject(new Error(`Could not start local auth server: ${err.message}`))
+      reject(new Error(`Could not start local auth server on port ${port}: ${err.message}`))
     })
   })
 }
@@ -106,10 +112,10 @@ export async function getAuthClient(): Promise<OAuth2Client> {
     throw new Error('Invalid credentials file - missing client_id or client_secret')
   }
 
-  // Use localhost redirect for desktop OAuth flow
-  const redirectUri =
-    redirect_uris?.find((u: string) => u.includes('localhost')) ||
-    'http://localhost:3456'
+  // For Desktop app credentials, Google allows any http://localhost port.
+  // We always use our own redirect URI with an explicit port so we can
+  // run a local server to catch the callback.
+  const redirectUri = `http://localhost:${AUTH_PORT}`
 
   const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirectUri)
 
@@ -142,9 +148,10 @@ async function authorizeInteractively(
     access_type: 'offline',
     scope: SCOPES,
     prompt: 'consent',
+    redirect_uri: `http://localhost:${AUTH_PORT}`,
   })
 
-  const code = await getAuthCodeViaLocalServer(authUrl)
+  const code = await getAuthCodeViaLocalServer(authUrl, AUTH_PORT)
   const { tokens } = await oAuth2Client.getToken(code)
   oAuth2Client.setCredentials(tokens)
   saveToken(tokens)
