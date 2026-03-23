@@ -1,0 +1,31 @@
+{
+  "name": "leo",
+  "version": "1.0.0",
+  "description": "SEO management CLI for Google Search Console",
+  "type": "module",
+  "bin": {
+    "leo": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js"
+  },
+  "keywords": ["seo", "google-search-console", "indexing", "cli"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@googleapis/searchconsole": "^6.0.1",
+    "chalk": "^5.6.2",
+    "commander": "^14.0.3",
+    "googleapis": "^171.4.0",
+    "ora": "^9.3.0",
+    "xml2js": "^0.6.2"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/xml2js": "^0.4.14",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
