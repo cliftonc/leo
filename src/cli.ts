@@ -429,13 +429,6 @@ program
       console.log(
         chalk.bold(`\nSubmitting ${urlsToSubmit.length} URLs for indexing...\n`)
       )
-      console.log(
-        chalk.dim(
-          'Note: The Indexing API is officially for JobPosting/BroadcastEvent pages.\n' +
-            'For other page types, consider using URL Inspection in Search Console UI.\n'
-        )
-      )
-
       let succeeded = 0
       let failed = 0
 
@@ -594,12 +587,6 @@ program
       }
 
       const submitRpm = parseInt(opts.submitRpm, 10)
-      console.log(
-        chalk.dim(
-          '\nNote: The Indexing API is officially for JobPosting/BroadcastEvent pages.\n' +
-            'For other page types it may work but is not guaranteed by Google.\n'
-        )
-      )
 
       const step3 = ora(`Step 3/3 — Submitting ${urlsToSubmit.length} URLs...`).start()
       let succeeded = 0
@@ -634,6 +621,79 @@ program
       console.log()
     } catch (err: any) {
       console.error(chalk.red(err.message))
+      process.exit(1)
+    }
+  })
+
+// ─── ping ────────────────────────────────────────────────────────
+
+program
+  .command('ping <domain>')
+  .description('Ping Google via WebSub to notify of sitemap changes')
+  .action(async (domain: string) => {
+    const spinner = ora('Fetching sitemap URL...').start()
+    try {
+      // Try to find the sitemap URL
+      let auth
+      try { auth = await getAuthClient() } catch { /* no auth, fine */ }
+
+      // Get registered sitemaps from GSC, or guess
+      let sitemapUrl: string | null = null
+      if (auth) {
+        try {
+          const sitemaps = await getSitemaps(auth, toSiteUrl(domain))
+          if (sitemaps.length > 0) {
+            sitemapUrl = sitemaps[0].path
+          }
+        } catch { /* fall through */ }
+      }
+
+      if (!sitemapUrl) {
+        // Try common paths
+        const guesses = [
+          `https://${domain}/sitemap.xml`,
+          `https://${domain}/sitemap-index.xml`,
+          `https://www.${domain}/sitemap.xml`,
+          `https://www.${domain}/sitemap-index.xml`,
+        ]
+        for (const url of guesses) {
+          try {
+            const res = await fetch(url, { method: 'HEAD' })
+            if (res.ok) { sitemapUrl = url; break }
+          } catch { continue }
+        }
+      }
+
+      if (!sitemapUrl) {
+        spinner.fail(`Could not find sitemap for ${domain}`)
+        process.exit(1)
+      }
+
+      spinner.text = `Pinging Google WebSub hub for ${sitemapUrl}...`
+
+      // Ping Google's WebSub (PubSubHubbub) hub
+      const hubUrl = 'https://pubsubhubbub.appspot.com/'
+      const body = new URLSearchParams({
+        'hub.mode': 'publish',
+        'hub.url': sitemapUrl,
+      })
+
+      const response = await fetch(hubUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+      })
+
+      if (response.ok || response.status === 204) {
+        spinner.succeed(`Pinged Google WebSub hub for ${chalk.bold(sitemapUrl)}`)
+        console.log(chalk.dim('  Google has been notified of sitemap changes.'))
+      } else {
+        spinner.fail(`WebSub ping failed: ${response.status} ${response.statusText}`)
+      }
+
+      console.log()
+    } catch (err: any) {
+      spinner.fail(err.message)
       process.exit(1)
     }
   })

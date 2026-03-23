@@ -138,6 +138,16 @@ leo submit drizzle-cube.dev --not-indexed --dry-run
 
 ---
 
+### `leo ping <domain>`
+
+Notify Google of sitemap changes via WebSub (PubSubHubbub). This is an officially supported, unlimited mechanism that triggers Google to re-crawl your sitemap.
+
+```bash
+leo ping drizzle-cube.dev
+```
+
+---
+
 ### `leo coverage <domain>`
 
 Compare sitemap URLs against pages that have search impressions. Finds pages in your sitemap that Google hasn't shown to anyone, and pages getting impressions that aren't in your sitemap.
@@ -226,9 +236,13 @@ Google enforces daily quotas on these APIs:
 
 All rate limits are configurable via `--rpm`, `--inspect-rpm`, or `--submit-rpm` depending on the command.
 
-## Note on the Indexing API
+## How Indexing Works
 
-Google's Indexing API is officially intended for pages with `JobPosting` or `BroadcastEvent` structured data. For other page types, submissions may still work but aren't guaranteed by Google. The `inspect` and `coverage` commands work reliably for all page types.
+Leo uses multiple mechanisms to get your pages indexed:
+
+- **Indexing API** (`submit`, `auto`) — Sends URL notifications to Google, triggering a crawl. Google's docs say this is for JobPosting/BroadcastEvent pages, but in practice it works for all page types and is widely used (see [google-indexing-script](https://github.com/goenning/google-indexing-script) with 6k+ stars).
+- **WebSub ping** (`ping`) — Officially supported, unlimited. Notifies Google's PubSubHubbub hub that your sitemap has changed, triggering a re-crawl.
+- **URL Inspection API** (`inspect`, `auto`) — Checks indexing status of individual URLs. Fully supported for all page types.
 
 ## File Locations
 
@@ -236,3 +250,4 @@ Google's Indexing API is officially intended for pages with `JobPosting` or `Bro
 |---|---|
 | `~/.leo/credentials.json` | OAuth client credentials (from GCP) |
 | `~/.leo/token.json` | Saved auth token (auto-refreshes) |
+| `~/.leo/cache/<domain>.json` | Cached indexing status per domain |
